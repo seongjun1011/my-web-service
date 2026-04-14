@@ -1,0 +1,31 @@
+version: "3.8"
+
+services:
+  web:
+    build: .
+    container_name: smartpantry-web
+    ports:
+      - "80:3000"
+    depends_on:
+      - db
+    environment:
+      - DB_HOST=db
+      - DB_USER=root
+      - DB_PASSWORD=1234      # <--- DB 설정과 똑같이 맞춤!
+      - DB_NAME=smartpantry   # <--- DB 설정과 똑같이 맞춤!
+    volumes:
+      - .:/app
+    restart: always
+
+  db:
+    image: mysql:8.0
+    container_name: smartpantry-db
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: 1234 # <--- web이 보내는 비번과 일치
+      MYSQL_DATABASE: smartpantry # <--- web이 접속할 이름과 일치
+    ports:
+      - "3306:3306"
+    volumes:S
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./mysql_data:/var/lib/mysql
