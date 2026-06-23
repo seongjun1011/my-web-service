@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48" viewBox="0 0 48 48">
+  <!-- 냉장고 본체 -->
+  <rect x="8" y="4" width="32" height="40" rx="4" ry="4" fill="#1e3a5f"/>
+  <!-- 냉동실 구분선 -->
+  <rect x="8" y="18" width="32" height="2.5" fill="#0f2540"/>
+  <!-- 냉동실 도어 -->
+  <rect x="9.5" y="5.5" width="29" height="11" rx="2" ry="2" fill="#2a5298"/>
+  <!-- 냉장실 도어 -->
+  <rect x="9.5" y="21" width="29" height="21.5" rx="2" ry="2" fill="#2a5298"/>
+  <!-- 냉동실 손잡이 -->
+  <rect x="20" y="9.5" width="8" height="2" rx="1" fill="#a0c4f1"/>
+  <!-- 냉장실 손잡이 -->
+  <rect x="20" y="29" width="8" height="2" rx="1" fill="#a0c4f1"/>
+  <!-- 냉동실 온도 표시 점 -->
+  <circle cx="15" cy="10.5" r="1.2" fill="#60a5fa"/>
+  <!-- 냉장실 아이콘 - 채소 선반 암시 -->
+  <rect x="13" y="35" width="22" height="1.5" rx="0.75" fill="#1a4a8a"/>
+  <rect x="13" y="38.5" width="22" height="1.5" rx="0.75" fill="#1a4a8a"/>
+</svg>

@@ -1,0 +1,282 @@
+"""
+food_llm_pipeline.py — LLM Vision 기반 식재료 인식 파이프라인
+
+변경사항:
+  - category_name을 server.js guessCategory와 동일한 11개 대분류로 통일
+"""
+
+import requests, base64, json, re, cv2
+import numpy as np
+from datetime import date, datetime, timedelta
+
+try:
+    from PIL import Image, ExifTags
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+from pipeline_common import calculate_use_by
+
+OLLAMA_URL = "https://ollama.aikopo.net"
+MODEL = "gemma4:26b"
+
+VALID_STORAGE = {"냉장", "냉동", "실온"}
+VALID_CATEGORIES = {
+    "채소류", "과일류", "육류", "수산물",
+    "유제품·계란", "두부·콩류", "가공·즉석식품",
+    "음료·주류", "양념·소스", "곡류·면류", "스낵·과자"
+}
+DATE_RE = re.compile(r'^\d{4}-\d{2}-\d{2}$')
+
+
+def fix_exif_rotation(img_path: str) -> np.ndarray:
+    if not PIL_AVAILABLE:
+        return cv2.imread(img_path)
+    try:
+        pil_img = Image.open(img_path)
+        exif = pil_img._getexif()
+        if exif:
+            orientation_key = next(
+                (k for k, v in ExifTags.TAGS.items() if v == "Orientation"), None
+            )
+            orientation = exif.get(orientation_key, 1) if orientation_key else 1
+            rotate_map = {3: 180, 6: 270, 8: 90}
+            angle = rotate_map.get(orientation, 0)
+            if angle:
+                pil_img = pil_img.rotate(angle, expand=True)
+        return cv2.cvtColor(np.array(pil_img.convert("RGB")), cv2.COLOR_RGB2BGR)
+    except Exception:
+        return cv2.imread(img_path)
+
+
+def encode_image(img: np.ndarray, max_width: int = 1500) -> str:
+    h, w = img.shape[:2]
+    if w > max_width:
+        scale = max_width / w
+        img = cv2.resize(img, (int(w * scale), int(h * scale)),
+                         interpolation=cv2.INTER_AREA)
+    _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    return base64.b64encode(buf).decode("utf-8")
+
+
+def is_valid_date(s: str) -> bool:
+    if not DATE_RE.match(s):
+        return False
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def _try_parse(text: str):
+    try:
+        parsed = json.loads(text)
+        return {"items": parsed} if isinstance(parsed, list) else parsed
+    except Exception:
+        pass
+    try:
+        from json_repair import repair_json
+        parsed = json.loads(repair_json(text))
+        return {"items": parsed} if isinstance(parsed, list) else parsed
+    except Exception:
+        pass
+    return None
+
+
+def parse_llm_json(text: str) -> dict:
+    result = _try_parse(text)
+    if result:
+        return result
+    for ch in ['{', '[']:
+        idx = text.rfind(ch)
+        if idx != -1:
+            result = _try_parse(text[idx:])
+            if result:
+                return result
+    print("[경고] JSON 파싱 실패")
+    print("[RAW]", text[:300])
+    return {"items": []}
+
+
+def stream_llm(payload: dict) -> str:
+    resp = requests.post(f"{OLLAMA_URL}/api/chat",
+                         json=payload, stream=True, timeout=300)
+    resp.raise_for_status()
+    content_buf = ""
+    for line in resp.iter_lines():
+        if line:
+            chunk = json.loads(line)
+            content_buf += chunk.get("message", {}).get("content", "")
+            if chunk.get("done"):
+                break
+    return content_buf.strip()
+
+
+def build_food_prompt() -> str:
+    return """너는 식재료 인식 전문가다. 이미지를 보고 식재료를 인식해서 JSON만 출력해라.
+
+[인식 규칙]
+- 이미지에 보이는 식재료/음식 재료만 인식한다
+- 식재료가 아닌 것(그릇, 칼, 배경 등)은 제외한다
+- 수량은 눈에 보이는 개수로 센다
+- 묶음 포장 수량 계산 규칙:          
+  · 포장지에 묶음 수량이 적혀있으면 그 수량을 qty로 사용
+    예) 라면 5개입 → qty: 5
+    예) 달걀 10구 → qty: 10
+    예) 캔맥주 6캔 묶음 → qty: 6
+  · 낱개로 여러 개 보이면 눈에 보이는 개수로 센다
+    예) 사과 3개가 보임 → qty: 3
+  · 포장 단위가 불명확하면 qty: 1로 처리
+
+[헷갈리기 쉬운 식재료 시각적 구분 규칙]
+비슷하게 생긴 식재료는 아래 시각적 특징으로 구분한다.
+여러 종류가 보이면 반드시 각각 따로 인식한다.
+
+파류 구분:
+  대파   → 굵고 긴 단일 줄기, 흰 부분이 길고 두꺼움, 위쪽은 진한 초록
+  쪽파   → 가늘고 짧음, 뿌리 부분이 붉은빛, 잎이 여러 갈래로 갈라짐
+  샐러리 → 줄기가 납작하고 홈이 파여 있음, 여러 대가 뭉쳐있고 연두색,
+            특유의 아삭한 줄기 형태 (파와 달리 속이 차 있고 납작함)
+  부추   → 매우 가늘고 납작한 잎, 진한 초록색, 뭉치로 자람
+
+감자류 구분:
+  감자   → 둥글고 껍질이 황갈색/흙색
+  고구마 → 길쭉하고 껍질이 붉은빛/자주색
+
+과일 구분:
+  귤    → 납작하고 작음, 껍질이 얇음
+  오렌지 → 완전한 구형, 크고 껍질이 두꺼움
+  자몽  → 오렌지보다 크고 껍질이 두꺼우며 노란빛
+
+무/순무 구분:
+  무    → 크고 흰색, 원통형
+  순무  → 작고 둥글며 보라빛 줄무늬
+
+[중요]
+이미지에 서로 다른 식재료가 여러 개 보이면
+하나로 합치지 말고 반드시 각각 별도 항목으로 출력한다.
+
+[name 작성 규칙]
+- 브랜드/상품명이 있으면 "식재료명(브랜드명)" 형식으로 출력
+- 브랜드/상품명이 없으면 식재료명만 출력
+  예) 오뚜기 참기름 → name:"참기름(오뚜기)"
+  예) 하이네켄 맥주 → name:"맥주(하이네켄)"
+  예) 신라면 → name:"신라면"
+  예) 햇반 → name:"즉석밥(햇반)"
+  예) 용가리 → name:"냉동치킨(용가리)"
+  예) 스팸 → name:"스팸"
+  예) 당근 → name:"당근"
+
+[category_name 작성 규칙]
+반드시 아래 11개 중 하나만 출력한다:
+  채소류      → 당근, 양파, 배추, 가지, 파프리카, 버섯, 콩나물 등 신선 채소
+  과일류      → 사과, 바나나, 딸기, 수박, 포도, 망고 등 신선 과일
+  육류        → 소고기, 돼지고기, 닭고기, 삼겹살, 베이컨, 스팸, 햄, 런천미트 등
+  수산물      → 고등어, 오징어, 새우, 참치, 어묵, 김, 미역 등
+  유제품·계란 → 우유, 치즈, 요거트, 버터, 달걀, 계란 등
+  두부·콩류   → 두부, 순두부, 두유, 콩, 콩나물 등
+  가공·즉석식품 → 라면, 즉석밥, 냉동만두, 통조림, 참치캔 등
+  음료·주류   → 생수, 주스, 사이다, 콜라, 맥주, 소주, 에너지드링크 등
+  양념·소스   → 간장, 고추장, 된장, 케첩, 마요네즈, 참기름, 고춧가루 등
+  곡류·면류   → 쌀, 밀가루, 국수, 식빵, 오트밀, 파스타 등
+  스낵·과자   → 과자, 아이스크림, 초콜릿, 젤리, 견과류 등
+
+[storage 규칙]
+"냉동", "냉장", "실온" 중 하나:
+  냉동: 냉동 가공식품, 냉동만두, 냉동새우 등
+  냉장: 신선 육류, 생선, 우유, 달걀, 두부, 어묵, 채소류, 김치
+  실온: 라면, 통조림, 즉석밥, 과자, 음료, 견과류, 과일, 양념류, 주류
+
+출력 스키마 (JSON만, 설명 없이):
+{
+  "items": [
+    {
+      "name": "식재료명 또는 식재료명(브랜드명)",
+      "category_name": "11개 카테고리 중 하나",
+      "qty": 1,
+      "storage": "냉장 | 냉동 | 실온"
+    }
+  ]
+}
+"""
+
+
+def process_food_llm(img_path: str) -> dict:
+    today = date.today().strftime("%Y-%m-%d")
+    img = fix_exif_rotation(img_path)
+    img_b64 = encode_image(img, max_width=1200)
+
+    print("[LLM Vision] 식재료 인식 중...")
+
+    payload = {
+        "model": MODEL,
+        "think": False,
+        "messages": [
+            {"role": "system", "content": build_food_prompt()},
+            {
+                "role": "user",
+                "content": "이 이미지에서 식재료를 인식해줘.",
+                "images": [img_b64]
+            }
+        ],
+        "format": "json",
+        "stream": True,
+        "options": {"temperature": 0, "num_predict": 2048}
+    }
+
+    raw_text = stream_llm(payload)
+
+    raw_text = raw_text.strip()
+    if raw_text.startswith("```"):
+        raw_text = re.sub(r'^```[a-zA-Z]*\n?', '', raw_text)
+        raw_text = re.sub(r'\n?```$', '', raw_text)
+        raw_text = raw_text.strip()
+
+    print("[LLM Vision RAW]:", raw_text[:300])
+    result = parse_llm_json(raw_text)
+
+    items = []
+    seen = set()
+    for it in result.get("items", []):
+        if not isinstance(it, dict):
+            continue
+
+        name = (it.get("name") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+
+        # category_name: 11개 대분류 검증
+        category_name = (it.get("category_name") or "").strip()
+        if category_name not in VALID_CATEGORIES:
+            category_name = None
+
+        storage = (it.get("storage") or "").strip()
+        if storage not in VALID_STORAGE:
+            storage = "실온"
+
+        use_by = calculate_use_by(name, storage, today)
+        print(f"  [{name}] category={category_name}, storage={storage} → use_by={use_by}")
+
+        items.append({
+            "name": name,
+            "category_name": category_name,
+            "qty": int(it.get("qty") or 1),
+            "storage": storage,
+            "use_by": use_by
+        })
+
+    print(f"[LLM Vision] 인식 완료: {len(items)}개")
+    return {
+        "source": "food_llm",
+        "purchase_date": today,
+        "items": items
+    }
+
+
+if __name__ == "__main__":
+    import sys
+    img_path = sys.argv[1] if len(sys.argv) > 1 else "/workspace/input/food_test.jpg"
+    result = process_food_llm(img_path)
+    print(json.dumps(result, ensure_ascii=False, indent=2))

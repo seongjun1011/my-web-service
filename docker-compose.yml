@@ -1,31 +1,78 @@
 version: "3.8"
 
 services:
+  # 1. 문지기 (Nginx)
+  nginx:
+    image: nginx:latest
+    container_name: smartpantry-proxy
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - frontend
+      - web
+    restart: always
+
+  # 2. 프론트엔드 (Vite + React)
+  frontend:
+    image: node:20
+    container_name: smartpantry-frontend
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    command: >
+      sh -c "npm install --include=dev &&
+             npx vite --host 0.0.0.0 --port 5173"
+    restart: always
+
+  # 3. 백엔드 (Node.js)
   web:
     build: .
     container_name: smartpantry-web
-    ports:
-      - "80:3000"
     depends_on:
       - db
+      - ai          # ← AI 서버가 먼저 올라와야 함
     environment:
       - DB_HOST=db
       - DB_USER=root
-      - DB_PASSWORD=1234      # <--- DB 설정과 똑같이 맞춤!
-      - DB_NAME=smartpantry   # <--- DB 설정과 똑같이 맞춤!
+      - DB_PASSWORD=1234
+      - DB_NAME=smartpantry
+      - AI_SERVER_URL=http://ai:8000   # ← AI 서버 주소
     volumes:
       - .:/app
     restart: always
 
+  # 4. 데이터베이스 (MySQL)
   db:
     image: mysql:8.0
     container_name: smartpantry-db
     restart: always
     environment:
-      MYSQL_ROOT_PASSWORD: 1234 # <--- web이 보내는 비번과 일치
-      MYSQL_DATABASE: smartpantry # <--- web이 접속할 이름과 일치
+      MYSQL_ROOT_PASSWORD: 1234
+      MYSQL_DATABASE: smartpantry
     ports:
       - "3306:3306"
-    volumes:S
+    volumes:
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
       - ./mysql_data:/var/lib/mysql
+
+  # 5. AI 식재료 인식 서버 (Python FastAPI)
+  ai:
+    build:
+      context: ./ai
+      dockerfile: Dockerfile.ai
+    container_name: smartpantry-ai
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./ai:/app
+    restart: always
+    # GPU가 있는 서버라면 아래 주석 해제
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]

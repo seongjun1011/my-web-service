@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+requests
+opencv-python-headless
+numpy
+Pillow
+json-repair
+ultralytics
